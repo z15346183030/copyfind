@@ -221,52 +221,45 @@ class TokenizerTests(unittest.TestCase):
         self.assertEqual(words("#!/usr/bin/env python\nx = 1"), ["x", "=", "1"])
 
 
-class HeaderTests(unittest.TestCase):
+class CommentHeaderTests(unittest.TestCase):
+    """A licence header is not a clone, and that is not a feature.
+
+    Comments never reach the token stream, so twenty identical lines at the top
+    of every file contribute nothing to compare. This is worth a test because it
+    is the one thing jscpd users complain about most, and the answer here is
+    structural rather than a flag that switches the header off.
+    """
+
     HEADER = (
-        "# Copyright 2021 Example Ltd.\n"
+        "# Copyright 2026 Example Ltd.\n"
         "# Licensed under the MIT licence.\n"
         "# See LICENSE for details.\n"
+        "#\n"
+        "# This file is part of a demo.\n"
     )
 
-    def test_header_extent_counts_leading_comment_lines(self):
-        text = self.HEADER + "\nx = 1\n"
-        self.assertEqual(cf.header_extent(text, "python"), 3)
+    def test_a_comment_header_contributes_no_tokens(self):
+        self.assertEqual(tokens(self.HEADER), [])
 
-    def test_header_extent_is_zero_without_a_comment_block(self):
-        self.assertEqual(cf.header_extent("x = 1\n", "python"), 0)
+    def test_identical_headers_over_different_code_are_not_a_clone(self):
+        files = {
+            "a.py": self.HEADER + "\ndef alpha(count):\n    total = 0\n"
+                    "    for i in range(count):\n        total += i * 3\n    return total\n",
+            "b.py": self.HEADER + "\ndef beta(items):\n    out = []\n"
+                    "    for item in items://n        out.append(item.strip())\n    return out\n",
+            "c.py": self.HEADER + "\ndef gamma(table):\n    keys = sorted(table)\n"
+                    "    return {k: table[k] for k in keys}\n",
+        }
+        _, classes, _, _ = build(files, min_tokens=8, min_lines=3)
+        self.assertEqual(classes, [])
 
-    def test_single_comment_line_is_not_a_header(self):
-        self.assertEqual(cf.header_extent("# note\nx = 1\n", "python"), 0)
-
-    def test_signature_ignores_the_year(self):
-        a = self.HEADER.replace("2021", "2026")
-        b = self.HEADER
-        self.assertEqual(cf.header_signature(a, "python")[0],
-                         cf.header_signature(b, "python")[0])
-
-    def test_offset_of_line(self):
-        text = "a\nbb\nccc\n"
-        self.assertEqual(cf.offset_of_line(text, 0), 0)
-        self.assertEqual(cf.offset_of_line(text, 2), 5)
-
-    def test_shared_headers_are_suppressed_before_detection(self):
-        files = {}
-        for i in range(5):
-            files[f"m{i}.py"] = self.HEADER + f"\ndef f{i}(x):\n    return x + {i}\n"
-        tmp = tempfile.mkdtemp()
-        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
-        for name, text in files.items():
-            with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
-                fh.write(text)
-        rc = subprocess.run(
-            [sys.executable, os.path.join(ROOT, "copyfind.py"), tmp, "--json"],
-            capture_output=True, text=True,
-        )
-        self.assertEqual(rc.returncode, 0, rc.stderr)
-        rep = json.loads(rc.stdout)
-        self.assertEqual(len(rep["boilerplate"]), 1)
-        self.assertEqual(rep["boilerplate"][0]["files"], 5)
-        self.assertEqual(rep["classes"], [])
+    def test_line_numbers_after_a_header_are_still_correct(self):
+        files = {
+            "a.py": self.HEADER + "\n" + BODY,
+            "b.py": self.HEADER + "\n" + BODY,
+        }
+        _, classes, _, _ = build(files)
+        self.assertEqual(classes[0]["locations"][0]["start"], 7)
 
 
 class DetectionTests(unittest.TestCase):

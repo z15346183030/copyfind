@@ -17,7 +17,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -36,7 +35,6 @@ _BASE = 1_000_003
 DEFAULT_MIN_TOKENS = 40
 DEFAULT_MIN_LINES = 5
 DEFAULT_MAX_POSTINGS = 200
-DEFAULT_BOILERPLATE_FILES = 3
 DEFAULT_MAX_BYTES = 1_500_000
 
 # Share of distinct tokens a window needs before it counts as evidence of a
@@ -120,7 +118,7 @@ _OP_START = frozenset("&|^~<>=+-*/%!")
 
 
 class SourceFile:
-    __slots__ = ("rel", "lang", "ids", "lines", "total_lines", "header")
+    __slots__ = ("rel", "lang", "ids", "lines", "total_lines")
 
     def __init__(self, rel, lang):
         self.rel = rel
@@ -128,7 +126,6 @@ class SourceFile:
         self.ids = array("i")
         self.lines = array("i")
         self.total_lines = 0
-        self.header = 0
 
 
 # --------------------------------------------------------------------------
@@ -494,58 +491,6 @@ def tokenize(text, lang, vocab, keep_names=True, start_line=1, start_offset=0):
     return ids, lines
 
 
-def header_extent(text, lang, max_lines=80):
-    """Number of leading lines occupied by a comment block, 0 if none.
-
-    License headers are identical in every file of a project, which is exactly
-    what a clone detector is built to find. Counting them as duplication buries
-    the clones that matter, so they are cut off before tokenizing and reported
-    separately.
-    """
-    line_c = LANGS[lang][0]
-    if not line_c:
-        return 0
-    lines = text.split("\n")
-    count = 0
-    last = 0
-    for idx, ln in enumerate(lines[:max_lines]):
-        s = ln.strip()
-        if not s:
-            continue
-        if any(s.startswith(m) for m in line_c):
-            count += 1
-            last = idx + 1
-            continue
-        break
-    return last if count >= 2 else 0
-
-
-def header_signature(text, lang):
-    n = header_extent(text, lang)
-    if not n:
-        return None
-    body = []
-    for ln in text.split("\n")[:n]:
-        s = ln.strip()
-        if s:
-            body.append(re.sub(r"\d", "#", s))
-    if len(body) < 2:
-        return None
-    return hashlib.sha1("\n".join(body).encode("utf-8", "replace")).hexdigest(), n
-
-
-def offset_of_line(text, n_lines):
-    if n_lines <= 0:
-        return 0
-    pos = 0
-    for _ in range(n_lines):
-        nxt = text.find("\n", pos)
-        if nxt < 0:
-            return len(text)
-        pos = nxt + 1
-    return pos
-
-
 # --------------------------------------------------------------------------
 # Rolling hash index
 # --------------------------------------------------------------------------
@@ -788,7 +733,7 @@ def _pct(part, whole):
     return (100.0 * part / whole) if whole else 0.0
 
 
-def build_report(root, files, classes, covered, elapsed, headers, stats, args):
+def build_report(root, files, classes, covered, elapsed, stats, args):
     total_tokens = sum(len(f.ids) for f in files)
     total_lines = sum(f.total_lines for f in files)
     dup_tokens = 0
@@ -818,7 +763,6 @@ def build_report(root, files, classes, covered, elapsed, headers, stats, args):
         },
         "classes": classes,
         "files_report": per_file,
-        "boilerplate": headers,
         "skipped_windows": stats,
         "settings": {
             "min_tokens": args.min_tokens,
@@ -847,14 +791,6 @@ def render_console(rep, top):
     add(f"clone classes {len(rep['classes'])}   {locs} locations, "
         f"{_n(sum(c['removable'] for c in rep['classes']))} tokens removable")
     add("")
-
-    if rep["boilerplate"]:
-        total_files = sum(h["files"] for h in rep["boilerplate"])
-        add(f"boilerplate  {len(rep['boilerplate'])} shared header block(s) in "
-            f"{total_files} files - excluded from the count")
-        for h in rep["boilerplate"][:2]:
-            add(f"  {h['files']} files x {h['lines']} lines   e.g. {h['sample']}")
-        add("")
 
     if rep["files_report"]:
         add("worst files")
@@ -905,8 +841,6 @@ def run(argv=None):
                     help="ignore identifier names (finds renamed copies)")
     ap.add_argument("--top", type=int, default=10,
                     help="how many clone classes to print (default 10)")
-    ap.add_argument("--boilerplate", type=int, default=DEFAULT_BOILERPLATE_FILES,
-                    help="suppress headers shared by this many files (default 3, 0 disables)")
     ap.add_argument("--max-postings", type=int, default=DEFAULT_MAX_POSTINGS,
                     help=argparse.SUPPRESS)
     ap.add_argument("--json", action="store_true", help="machine-readable output")
@@ -956,31 +890,6 @@ def run(argv=None):
         text = _read_text(full)
         texts.append(text)
 
-    # Pass 1: which leading comment blocks are project boilerplate.
-    sig_count = defaultdict(int)
-    sig_lines = {}
-    sig_sample = {}
-    for (full, rel, lang), text in zip(targets, texts):
-        if text is None:
-            continue
-        got = header_signature(text, lang)
-        if got:
-            sig, n = got
-            sig_count[sig] += 1
-            sig_lines[sig] = n
-            if sig not in sig_sample:
-                sig_sample[sig] = rel
-
-    headers = []
-    suppressed = set()
-    if args.boilerplate > 0:
-        for sig, cnt in sig_count.items():
-            if cnt >= args.boilerplate:
-                suppressed.add(sig)
-                headers.append({"files": cnt, "lines": sig_lines[sig],
-                                "sample": sig_sample[sig]})
-        headers.sort(key=lambda h: (-h["files"], h["sample"]))
-
     vocab = {}
     files = []
     for (full, rel, lang), text in zip(targets, texts):
@@ -988,17 +897,7 @@ def run(argv=None):
             continue
         f = SourceFile(rel, lang)
         f.total_lines = text.count("\n") + (0 if text.endswith("\n") else 1)
-        skip = 0
-        if suppressed:
-            got = header_signature(text, lang)
-            if got and got[0] in suppressed:
-                skip = got[1]
-        f.header = skip
-        off = offset_of_line(text, skip)
-        ids, lines = tokenize(text, lang, vocab, keep_names=not args.names,
-                              start_line=skip + 1, start_offset=off)
-        f.ids = ids
-        f.lines = lines
+        f.ids, f.lines = tokenize(text, lang, vocab, keep_names=not args.names)
         files.append(f)
     texts = None
 
@@ -1011,7 +910,7 @@ def run(argv=None):
     elapsed = time.perf_counter() - started
 
     rep = build_report(roots[0] if len(roots) == 1 else " ".join(roots),
-                       files, classes, covered, elapsed, headers, stats, args)
+                       files, classes, covered, elapsed, stats, args)
 
     if args.json:
         json.dump(rep, sys.stdout, indent=2, ensure_ascii=False)
